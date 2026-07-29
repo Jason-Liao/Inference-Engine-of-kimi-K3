@@ -374,7 +374,103 @@ python3 c/tools/convert_kimik3.py --src /path/to/k3 --dst /path/to/k3_int8
 
 ---
 
-## 八、致谢
+## 八、路线图:迈向全量生产级(社区贡献招募)
+
+### 现状(诚实说明)
+
+本项目已对齐 colibri 的**生产级基础设施**:采样系统(nucleus/temperature)、KV 落盘(`KVSAVE`)、NUMA 绑定、OpenAI server 适配器(`K3Engine`)、bf16 驻留、PIPE/DSA/PILOT 流水线。
+
+但目前 `kimik3` 在 `openai_server.py` 中是**二等公民**:`K3Engine` 适配器每次请求都 fork 新进程、重新加载模型、跑完即退出(见 [openai_server.py:1010-1125](c/openai_server.py#L1010))。这导致:
+
+- 每请求付一次完整模型加载开销(对 2.8T 的真实 K3 不可接受)
+- 无流式输出(生成完才一次性吐出)
+- 无多会话(`kv_slots=1` 硬编码)
+- 无 KV 跨请求复用
+
+以下 6 项是让 `kimik3` 成为 `openai_server.py` **一等公民**、达到全量生产级的补齐路径。**完成 1–3 可在 CPU 上达到"可服务、内存可控"的最低门槛;完成 4–6 才是真正的高吞吐生产级。**
+
+### 路线图(按优先级)
+
+#### 🔴 P0-1:实现 `SERVE`/`SERVE_BATCH` 协议(最高优先级)
+
+| 项 | 说明 |
+|---|---|
+| **目标** | 持久进程 + 流式 token 输出 + 多 KV slot,让 `openai_server.py` 的 `Engine` 类(而非 `K3Engine`)能驱动 kimik3 |
+| **现状** | `main()` 仅支持 `--config-check`/`--load-check`/生成/PPL 四种一次性模式,0 行 socket/serve 代码 |
+| **参考实现** | [colibri.c:5397 `run_serve_mux`](c/colibri.c#L5397) —— stdin/stdout 字节协议:`\x01\x01READY\x01\x01\n` 哨兵 + `DATA <id> <n>\n<bytes>\n` 逐 token 流式 + `DONE <id> STAT ...` 收尾 |
+| **协议规范** | 启动输出 `READY` + `STAT`;stdin 读 `SUBMIT <id> <slot> <bytes> <max> <temp> <topp>` 帧;每 token 输出 `DATA`;回合结束输出 `DONE`;支持 `CANCEL <id>` |
+| **验收标准** | `SERVE=1 SERVE_BATCH=1 KV_SLOTS=4 ./kimik3` 启动后输出 READY;`openai_server.py --engine kimik3` 走 `Engine` 路径(非 `K3Engine`);`/v1/chat/completions` 流式 SSE 逐 token 返回 |
+| **预计改动** | ~400 行 C,新增 `run_serve_mux_k3()` + `ServeCtx`/`ServeReq` 结构 + `mux_data`/`mux_done`/`mux_submit` |
+
+#### 🔴 P0-2:接入 `quant.h` 多架构 SIMD kernel
+
+| 项 | 说明 |
+|---|---|
+| **目标** | 替换 3 个标量 matmul 为 AVX-VNNI/AVX-512/ARM NEON-SDOT/i8mm kernel,CPU 推理提速 5–10×,并打开 int4 量化路径 |
+| **现状** | `matmul`/`matmul_bf16`/`matmul_q` 全是 `#pragma omp` + 标量 `acc += xs[i]*w[i]`,靠 `-O3` 自动向量化;`matmul_q` 签名仅 `(I,O)` **只支持 S=1** |
+| **参考实现** | [quant.h](c/quant.h) —— header-only 多架构库:`matmul_q`(L105)、`matmul_i4`(L125)、`matmul_i4_grouped`(L168)、IDOT `dot_i8i8`/`dot_i4i8`(L402-614)、ARM i8mm SMMLA 2×2 tiled(L617-724) |
+| **验收标准** | `#include "quant.h"`;`matmul_q` 支持任意 S;新增 `int4` 量化格式(`tools/convert_kimik3.py` 增加 `--fmt int4`);`make kimik3` 在 x86/ARM 均通过;`tests/test_kimik3.py` 全绿且 greedy 输出 bit-identical |
+| **预计改动** | ~150 行 C(替换 matmul + dispatch)+ convert 脚本扩展 |
+
+#### 🔴 P0-3:MLA KV cache 低秩压缩
+
+| 项 | 说明 |
+|---|---|
+| **目标** | 仿 colibri 只存 `Lc[kv_lora] + Rc[qk_rope]`,用 `kv_b` 即时重建 K_nope/V,长上下文 KV 内存降 ~57× |
+| **现状** | 存全量 `K_nope + V + K_rot`(per-token 32768 个 fp32),无压缩 |
+| **参考实现** | [colibri.c:184-187 `KVState`](c/colibri.c#L184) —— 注释"576 vs 32768 valori/token";`kv_b` 权重即时投影重建 K_nope/V([colibri.c:2664](c/colibri.c#L2664)) |
+| **验收标准** | 128K 上下文 KV 内存 < 20 GB(当前需 ~1.1 TB);`tests/test_kimik3.py` greedy 输出 bit-identical;新增长上下文内存测试 |
+| **风险提示** | ⚠️ 改动核心数据结构,回归风险高,需以现有 49 个测试为安全网逐层验证 |
+
+#### 🟠 P1-4:fused gate+up kernel
+
+| 项 | 说明 |
+|---|---|
+| **目标** | 仿 `matmul_i4_grouped_pair`,读 x 一次同时算 gate + up 两个矩阵,省 ~33% expert matmul 时间 |
+| **现状** | expert 路径 3 次独立 `matmul_q`,`xin` 读两遍,每次 fork/join OpenMP |
+| **参考实现** | [colibri.c:469 `matmul_i4_grouped_pair`](c/colibri.c#L469) —— 注释"reading x once instead of twice — saves ~33%";[quant.h:205 `matmul_i4_pair`](c/quant.h#L205) |
+| **验收标准** | 新增 `matmul_q_pair`/`matmul_i4_grouped_pair` 调用点;expert matmul 基准测试提速 ≥25%;输出 bit-identical |
+
+#### 🟠 P1-5:CUDA 后端接入
+
+| 项 | 说明 |
+|---|---|
+| **目标** | 至少接入 `backend_cuda.cu` 的 `expert_mlp` + `attention_absorb`,启用 w4a16 + Tensor Core,让真实 K3 推理变得可行 |
+| **现状** | 0 行 CUDA/Metal 代码,不包含 `backend_cuda.h`/`backend_gpu_compat.h` |
+| **参考实现** | [backend_cuda.cu](c/backend_cuda.cu) —— `expert_mlp`(融合 gate/up/down,激活只过 PCIe 一次)、`attention_absorb`/`_batch`、w4a16 Tensor Core(L173)、WMMA s4 m8n8k32(L246);[colibri.c:5940-6058](c/colibri.c#L5940) VRAM 预算管理 |
+| **验收标准** | `COLI_CUDA=1 CUDA_EXPERT_GB=auto make kimik3` 编译通过;expert MLP 在 GPU 执行;单卡可加载 ≥64 个 expert 到 VRAM;无 GPU 时安全回退 CPU |
+| **环境限制** | 本仓库 CI 无 GPU,需贡献者自带 CUDA 环境验证 |
+
+#### 🟠 P1-6:continuous batching(ragged decode)
+
+| 项 | 说明 |
+|---|---|
+| **目标** | `step_decode_batch` ragged 路径,多请求合并进一次 forward pass decode |
+| **现状** | 单会话,无多请求调度 |
+| **参考实现** | [colibri.c:4289 `step_decode_batch`](c/colibri.c#L4289) —— "One decode token from each independent sequence, evaluated as a single MoE batch";最多 512 行 ragged KV |
+| **依赖** | 需先完成 P0-1(SERVE 协议)和 P0-3(KV 压缩,否则多 slot KV 内存爆炸) |
+| **验收标准** | 4 并发请求 decode 吞吐 ≥ 单请求 3×;每 slot KV 独立;`tests/test_openai_server_kimik3.py` 新增并发测试 |
+
+### 如何贡献
+
+1. **认领任务**:在 GitHub Issues 中开 issue 标注 `[ROADMAP-Px-N]`,说明你打算实现哪一项
+2. **分支约定**:从 `main` 切出 `feature/<px-n>-<short-desc>` 分支
+3. **测试要求**:所有 PR 必须保持 `tests/test_kimik3.py`(49 个)和 `tests/test_openai_server_kimik3.py`(10 个)全绿;新增功能需附带测试
+4. **bit-identical 约定**:性能优化类 PR(P0-2/P1-4)的 greedy 路径(默认采样)输出必须与 `main` 分支 bit-identical
+5. **代码风格**:遵循现有 C 代码风格(4 空格缩进、`static` 内部函数、OpenMP `parallel for`)
+6. **参考蓝本**:所有项均有 colibri 对应实现,PR 描述中请引用参考代码位置
+
+### 贡献者
+
+感谢以下为迈向全量生产级做出贡献的开发者(按首次 PR 时间排序):
+
+<!-- 贡献者通过 PR 自动追加,格式:- @github_handle — Px-N 简述 -->
+
+*期待你的加入。*
+
+---
+
+## 九、致谢
 
 - **[JustVugg/colibri](https://github.com/JustVugg/colibri)** —— 基础框架,提供流式 MoE 加载、safetensors 解析、O200K tokenizer、OpenAI server、PIPE/DSA/PILOT/NUMA/DUAL-SSD 等全部基础设施设计
 - **[Moonshot AI](https://github.com/MoonshotAI/Kimi-K3)** —— Kimi-K3 模型与技术报告
@@ -382,7 +478,7 @@ python3 c/tools/convert_kimik3.py --src /path/to/k3 --dst /path/to/k3_int8
 
 ---
 
-## 九、开源条款
+## 十、开源条款
 
 本项目继承上游 [colibri](https://github.com/JustVugg/colibri) 的 **Apache License 2.0**。详见 [LICENSE](LICENSE)。
 
