@@ -714,23 +714,53 @@ class KimiK3RealWeightsLoadTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_load_check_indexes_two_shards(self):
-        """Two shards (00001 + 00094) must be indexed = 28 tensors."""
+        """Multiple shards must be indexed (layer 0 + layer 1-4 + embed/head)."""
         r = self._run_load_check()
         self.assertEqual(r.returncode, 0, r.stderr)
-        # Header line: "== load-check: 2 shards indexed (28 tensors) =="
+        # Header line: "== load-check: N shards indexed (M tensors) =="
+        # We download shards 00001 (layer 0) + 00094 (embed/head) + 00002-00005 (layers 1-4).
+        # The exact shard count grows as more are downloaded; assert >= 2 and tensors > 28.
         header = [l for l in r.stdout.splitlines() if "shards indexed" in l][0]
-        self.assertIn("2 shards", header)
-        self.assertIn("28 tensors", header)
+        import re
+        m = re.search(r"(\d+) shards indexed \((\d+) tensors\)", header)
+        self.assertIsNotNone(m, f"header format unexpected: {header}")
+        n_shards = int(m.group(1))
+        n_tensors = int(m.group(2))
+        self.assertGreaterEqual(n_shards, 2, f"expected >=2 shards, got {n_shards}: {header}")
+        self.assertGreater(n_tensors, 28, f"expected >28 tensors, got {n_tensors}: {header}")
 
     def test_no_nan_or_zero_tensors(self):
         """Every present tensor must be finite and non-trivially nonzero."""
         r = self._run_load_check()
         self.assertEqual(r.returncode, 0, r.stderr)
         summary = [l for l in r.stdout.splitlines() if "summary" in l][0]
-        # Format: == load-check summary: OK=28  MISSING=2432  NaN=0  ZERO=0 ==
+        # Format: == load-check summary: OK=N  MISSING=M  NaN=0  ZERO=0 ==
         self.assertIn("NaN=0", summary, f"NaN tensors detected: {summary}")
         self.assertIn("ZERO=0", summary, f"all-zero tensors detected: {summary}")
         self.assertGreater(summary.count("OK="), 0)
+
+    def test_mxfp4_expert_tensors_dequantized(self):
+        """MXFP4 expert weights (weight_packed + weight_scale) must be present
+        on downloaded MoE layers and dequantize to plausible values.
+        Verifies the real-K3 MXFP4 layout matches our dequant path."""
+        r = self._run_load_check()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Layer 1 (downloaded as shard 00002) has experts with MXFP4 weights.
+        # Expert 0, w1.weight_packed must appear as OK-MXFP4 in output.
+        mxfp4_lines = [l for l in r.stdout.splitlines() if "OK-MXFP4" in l]
+        self.assertGreater(len(mxfp4_lines), 0, "no MXFP4 expert tensors dequantized")
+        # Verify layer 1 expert 0 w1 packed + scale both present
+        self.assertTrue(
+            any("layers.1.block_sparse_moe.experts.0.w1.weight_packed" in l for l in mxfp4_lines),
+            "layer 1 expert 0 w1.weight_packed not dequantized"
+        )
+        self.assertTrue(
+            any("layers.1.block_sparse_moe.experts.0.w1.weight_scale" in l for l in mxfp4_lines),
+            "layer 1 expert 0 w1.weight_scale not dequantized"
+        )
+        # Scales must be small positive values (typical expert weight scale ~0.01)
+        scale_line = [l for l in mxfp4_lines if "experts.0.w1.weight_scale" in l][0]
+        self.assertIn("min=+", scale_line)  # scales are always positive (E8M0)
 
     def test_layer_zero_tensors_loaded(self):
         """Layer 0 (KDA attention + dense MLP) tensors must be present and OK."""

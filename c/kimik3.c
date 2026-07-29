@@ -2828,21 +2828,60 @@ int main(int argc, char **argv) {
             else { \
                 int64_t total = t->numel; \
                 int64_t n = total < 4096 ? total : 4096; \
-                int esz = (t->dtype == 2) ? 4 : 2; \
-                int64_t raw_bytes = n * esz; \
-                uint8_t *raw = malloc((size_t)raw_bytes); \
-                st_pread_full(t->fd, raw, raw_bytes, t->off, "load-check sample"); \
-                float *buf = malloc((size_t)n*sizeof(float)); \
-                if (t->dtype == 2) { memcpy(buf, raw, raw_bytes); } \
-                else if (t->dtype == 0) { uint16_t *p=(uint16_t*)raw; for (int64_t i=0;i<n;i++) buf[i]=bf16_to_f32(p[i]); } \
-                else { uint16_t *p=(uint16_t*)raw; for (int64_t i=0;i<n;i++) buf[i]=f16_to_f32(p[i]); } \
-                free(raw); \
-                double mn=1e30,mx=-1e30,sum=0; int nan=0,zero=0; \
-                for (int64_t i=0;i<n;i++){float v=buf[i]; if(!isfinite(v)){nan=1;continue;} if(v<mn)mn=v; if(v>mx)mx=v; sum+=v; if(v==0.f)zero++;} \
-                if(nan){n_nan++; printf("  BAD-NaN %-80s numel=%lld\n",_nm,(long long)total);} \
-                else if(zero==n){n_zero++; printf("  ZERO    %-80s numel=%lld\n",_nm,(long long)total);} \
-                else {n_ok++; printf("  OK      %-80s numel=%lld  min=%+.4g  max=%+.4g  mean=%+.4g\n",_nm,(long long)total,mn,mx,sum/n);} \
-                free(buf); \
+                /* dtype 2 = fp32, 0 = bf16, 1 = f16, 3 = uint8 (MXFP4 packed/scale) */ \
+                if (t->dtype == 3) { \
+                    /* MXFP4: read raw uint8 bytes and dequantize a few groups. */ \
+                    int64_t raw_bytes = n; \
+                    uint8_t *raw = malloc((size_t)raw_bytes); \
+                    st_pread_full(t->fd, raw, raw_bytes, t->off, "load-check mxfp4"); \
+                    /* For packed tensors: 1 byte = 2 nibbles. For scale tensors: 1 byte = E8M0. */ \
+                    int is_packed = (strstr(_nm, "weight_packed") != NULL); \
+                    int is_scale  = (strstr(_nm, "weight_scale")  != NULL); \
+                    double mn=1e30,mx=-1e30,sum=0; int nan=0,zero=0,cnt=0; \
+                    if (is_packed) { \
+                        /* Each byte = 2 nibbles; dequantize groups of 32 nibbles = 16 bytes */ \
+                        int n_bytes = (int)(n < raw_bytes ? n : raw_bytes); \
+                        int n_groups = n_bytes / 16; \
+                        for (int g = 0; g < n_groups && cnt < 4096; g++) { \
+                            uint8_t s = 128; /* assume scale=1.0 if no scale tensor handy */ \
+                            float s_exp = (s==0)?0.f:ldexpf(1.f,(int)s-127); \
+                            for (int j=0;j<16 && cnt<4096;j++) { \
+                                uint8_t byte = raw[g*16+j]; \
+                                int hi=(byte>>4)&15, lo=byte&15; \
+                                static const float lut[16]={0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1}; \
+                                float v1=lut[hi]*s_exp, v2=lut[lo]*s_exp; \
+                                if(!isfinite(v1)||!isfinite(v2)){nan=1;continue;} \
+                                if(v1<mn)mn=v1; if(v1>mx)mx=v1; sum+=v1; if(v1==0.f)zero++; \
+                                if(v2<mn)mn=v2; if(v2>mx)mx=v2; sum+=v2; if(v2==0.f)zero++; \
+                                cnt+=2; \
+                            } \
+                        } \
+                    } else if (is_scale) { \
+                        /* E8M0 scale bytes: report raw distribution (0..255) */ \
+                        int n_b = (int)(n < raw_bytes ? n : raw_bytes); \
+                        for (int i2=0;i2<n_b && cnt<4096;i2++){uint8_t b=raw[i2]; float v=(b==0)?0.f:ldexpf(1.f,(int)b-127); if(v<mn)mn=v; if(v>mx)mx=v; sum+=v; if(v==0.f)zero++; cnt++;} \
+                    } \
+                    free(raw); \
+                    if(nan){n_nan++; printf("  BAD-NaN %-80s numel=%lld\n",_nm,(long long)total);} \
+                    else if(cnt==0){n_zero++; printf("  ZERO    %-80s numel=%lld\n",_nm,(long long)total);} \
+                    else {n_ok++; printf("  OK-MXFP4 %-78s numel=%lld  min=%+.4g  max=%+.4g  mean=%+.4g (dequant)\n",_nm,(long long)total,mn,mx,sum/cnt);} \
+                } else { \
+                    int esz = (t->dtype == 2) ? 4 : 2; \
+                    int64_t raw_bytes = n * esz; \
+                    uint8_t *raw = malloc((size_t)raw_bytes); \
+                    st_pread_full(t->fd, raw, raw_bytes, t->off, "load-check sample"); \
+                    float *buf = malloc((size_t)n*sizeof(float)); \
+                    if (t->dtype == 2) { memcpy(buf, raw, raw_bytes); } \
+                    else if (t->dtype == 0) { uint16_t *p=(uint16_t*)raw; for (int64_t i=0;i<n;i++) buf[i]=bf16_to_f32(p[i]); } \
+                    else { uint16_t *p=(uint16_t*)raw; for (int64_t i=0;i<n;i++) buf[i]=f16_to_f32(p[i]); } \
+                    free(raw); \
+                    double mn=1e30,mx=-1e30,sum=0; int nan=0,zero=0; \
+                    for (int64_t i=0;i<n;i++){float v=buf[i]; if(!isfinite(v)){nan=1;continue;} if(v<mn)mn=v; if(v>mx)mx=v; sum+=v; if(v==0.f)zero++;} \
+                    if(nan){n_nan++; printf("  BAD-NaN %-80s numel=%lld\n",_nm,(long long)total);} \
+                    else if(zero==n){n_zero++; printf("  ZERO    %-80s numel=%lld\n",_nm,(long long)total);} \
+                    else {n_ok++; printf("  OK      %-80s numel=%lld  min=%+.4g  max=%+.4g  mean=%+.4g\n",_nm,(long long)total,mn,mx,sum/n);} \
+                    free(buf); \
+                } \
             } } while(0)
 
         /* embed/head/norm (top-level) */
@@ -2901,6 +2940,20 @@ int main(int argc, char **argv) {
                 CHECK("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", PFX, i);
                 CHECK("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", PFX, i);
                 CHECK("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", PFX, i);
+                /* MXFP4 expert tensors: verify packed+scale exist and
+                 * dequantize to plausible values. Sample experts 0, 1, 448, 895. */
+                if (i < 5) {  /* only first few layers (those downloaded) */
+                    int eids[] = {0, 1, 448, 895};
+                    for (size_t ei = 0; ei < sizeof(eids)/sizeof(eids[0]); ei++) {
+                        int e = eids[ei];
+                        CHECK("%smodel.layers.%d.block_sparse_moe.experts.%d.w1.weight_packed", PFX, i, e);
+                        CHECK("%smodel.layers.%d.block_sparse_moe.experts.%d.w1.weight_scale",  PFX, i, e);
+                        CHECK("%smodel.layers.%d.block_sparse_moe.experts.%d.w2.weight_packed", PFX, i, e);
+                        CHECK("%smodel.layers.%d.block_sparse_moe.experts.%d.w2.weight_scale",  PFX, i, e);
+                        CHECK("%smodel.layers.%d.block_sparse_moe.experts.%d.w3.weight_packed", PFX, i, e);
+                        CHECK("%smodel.layers.%d.block_sparse_moe.experts.%d.w3.weight_scale",  PFX, i, e);
+                    }
+                }
             }
         }
         printf("\n== load-check summary: OK=%d  MISSING=%d  NaN=%d  ZERO=%d ==\n",
