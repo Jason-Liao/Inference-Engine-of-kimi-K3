@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -965,6 +966,181 @@ class Engine:
             self.dispatcher.join(timeout=5)
 
 
+def is_k3_engine(engine_path):
+    """True if the engine path points at the Kimi-K3 engine (./kimik3)."""
+    if not engine_path:
+        return False
+    name = Path(str(engine_path)).name.lower()
+    return "kimik3" in name
+
+
+def render_chat_k3(messages, tools=None, tool_choice=None):
+    """Render OpenAI messages into a text prompt for the K3 engine.
+
+    K3 uses the O200K tokenizer and its own chat template (<|im_start|>/
+    <|im_end|>). Since the engine works on token IDs (not text), this function
+    produces a plain-text rendering that the K3Engine encodes to bytes/tokens.
+    For the real K3 model the tokenizer.json in the snapshot handles the actual
+    chat-template markers; for the tiny test model (vocab=256, no tokenizer) we
+    fall back to byte-level encoding, so a simple human-readable format works."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    parts = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role in ("system", "developer"):
+            parts.append("System: " + content_text(message.get("content"), f"messages.{index}.content"))
+        elif role == "user":
+            parts.append("User: " + content_text(message.get("content"), f'messages.{index}.content'))
+        elif role == "assistant":
+            raw = message.get("content")
+            text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            parts.append("Assistant: " + text.strip())
+        elif role == "tool":
+            parts.append("Tool: " + content_text(message.get("content"), f'messages.{index}.content'))
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+    parts.append("Assistant:")
+    return "\n".join(parts)
+
+
+class K3Engine:
+    """Engine adapter for the Kimi-K3 C engine (kimik3.c).
+
+    Unlike the colibri engine, kimik3 is a one-shot binary: it reads a ref.json
+    (prompt_ids + full_ids), generates `len(full_ids) - len(prompt_ids)` tokens,
+    prints them to stdout, and exits. There is no persistent SERVE protocol.
+    This adapter spawns a fresh subprocess per generate() call, writing a
+    temporary ref.json and parsing the "C engine :" output line.
+
+    Tokenization: if `tokenizers` is installed and tokenizer.json exists in the
+    model directory, it is used. Otherwise (e.g. the tiny test model with
+    vocab=256 and no tokenizer.json), byte-level encoding is used: each UTF-8
+    byte of the prompt becomes a token ID, and generated token IDs are decoded
+    back as UTF-8 bytes. This works because the tiny model's vocab (256) covers
+    all byte values."""
+
+    def __init__(self, executable, model, cap=16, max_tokens=1024, env=None):
+        self.executable = str(executable)
+        self.model = str(model)
+        self.cap = cap
+        self.max_tokens = max_tokens
+        self.env = dict(env or os.environ)
+        self.kv_slots = 1
+        self.closed = False
+        # Attributes expected by the API handler introspection (tiers, hwinfo, etc.)
+        self.tiers = None
+        self.hwinfo = None
+        self.emap = None
+        self.hits = None
+        self.hits_seq = 0
+        self.profile = collections.deque(maxlen=PROFILE_TURNS)
+        self.profile_seq = 0
+        self._tokenizer = None
+        self._vocab_size = 256
+        self._load_tokenizer()
+
+    def _load_tokenizer(self):
+        """Try to load a HuggingFace tokenizer from the model directory."""
+        tok_path = Path(self.model) / "tokenizer.json"
+        if not tok_path.is_file():
+            return
+        try:
+            from tokenizers import Tokenizer
+        except ImportError:
+            return
+        try:
+            self._tokenizer = Tokenizer.from_file(str(tok_path))
+            self._vocab_size = self._tokenizer.get_vocab_size()
+        except Exception:
+            self._tokenizer = None
+
+    def _encode(self, text):
+        """Encode text to a list of token IDs."""
+        if self._tokenizer is not None:
+            return self._tokenizer.encode(text).ids
+        # Byte-level fallback: UTF-8 bytes as token IDs (vocab >= 256).
+        return list(text.encode("utf-8"))
+
+    def _decode(self, token_ids):
+        """Decode a list of token IDs to text."""
+        if self._tokenizer is not None:
+            return self._tokenizer.decode(token_ids)
+        # Byte-level fallback: interpret IDs as bytes.
+        byte_vals = []
+        for tid in token_ids:
+            if 0 <= tid < 256:
+                byte_vals.append(tid)
+        return bytes(byte_vals).decode("utf-8", "replace")
+
+    @staticmethod
+    def _parse_engine_output(stdout):
+        """Extract generated token IDs from the engine's stdout.
+
+        The engine prints "C engine : t1 t2 t3 ..." on its own line."""
+        for line in stdout.splitlines():
+            if line.startswith("C engine :"):
+                rest = line.split(":", 1)[1].strip()
+                return [int(x) for x in rest.split()] if rest else []
+        return []
+
+    def generate(self, prompt, max_tokens, temperature, top_p, on_text,
+                 cache_slot=0, cancelled=None, grammar=None):
+        """Generate text from a prompt by spawning a one-shot kimik3 subprocess."""
+        if self.closed:
+            raise RuntimeError("K3 engine is shutting down")
+        prompt_ids = self._encode(prompt)
+        if not prompt_ids:
+            prompt_ids = [0]
+        # full_ids = prompt_ids + max_tokens placeholder tokens (the engine
+        # generates len(full_ids) - len(prompt_ids) tokens).
+        n_new = max(1, max_tokens)
+        full_ids = list(prompt_ids) + [0] * n_new
+        # Write a temporary ref.json for the engine to consume.
+        ref_fd, ref_path = tempfile.mkstemp(suffix=".json", prefix="k3_ref_")
+        try:
+            with os.fdopen(ref_fd, "w") as f:
+                json.dump({"prompt_ids": prompt_ids, "full_ids": full_ids}, f)
+            child_env = dict(self.env, SNAP=self.model,
+                             TEMP=str(temperature), TOPP=str(top_p))
+            proc = subprocess.Popen(
+                [self.executable, str(self.cap), ref_path],
+                env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            try:
+                stdout, _stderr = proc.communicate(timeout=600)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise RuntimeError("K3 engine timed out")
+            if proc.poll() is not None and proc.returncode != 0:
+                raise RuntimeError(f"K3 engine exited with code {proc.returncode}")
+            token_ids = self._parse_engine_output(stdout.decode("utf-8", "replace"))
+            text = self._decode(token_ids)
+            if text:
+                on_text(text)
+            return {
+                "completion_tokens": len(token_ids),
+                "tokens_per_second": 0.0,
+                "cache_hit_percent": 0.0,
+                "rss_gb": 0.0,
+                "prompt_tokens": len(prompt_ids),
+                "length_limited": len(token_ids) >= n_new,
+            }
+        finally:
+            try:
+                os.unlink(ref_path)
+            except OSError:
+                pass
+
+    def close(self):
+        self.closed = True
+
+
 def model_object(model_id, created):
     return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
 
@@ -1221,6 +1397,15 @@ class APIHandler(BaseHTTPRequestHandler):
         if dbg >= 2:
             sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
             sys.stderr.flush()
+        k3 = isinstance(self.server.engine, K3Engine)
+        # K3 supports stop sequences (post-processed in Python); GLM does not.
+        # Strip stop from the body copy so generation_options doesn't reject it.
+        stop_seqs = None
+        if k3:
+            stop_raw = body.get("stop")
+            if stop_raw is not None:
+                stop_seqs = [stop_raw] if isinstance(stop_raw, str) else list(stop_raw)
+                body = {k: v for k, v in body.items() if k != "stop"}
         maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
@@ -1252,7 +1437,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, output.append, cache_slot,
                     self.client_disconnected, grammar=grammar)
                 text = "".join(output)
-                length_finish = "length" if stats["length_limited"] else "stop"
+                stop_hit = False
+                if stop_seqs:
+                    for seq in stop_seqs:
+                        if seq and seq in text:
+                            text = text.split(seq, 1)[0]
+                            stop_hit = True
+                            break
+                length_finish = "length" if stats["length_limited"] else ("stop" if stop_hit else "stop")
                 if chat and tools:
                     content, calls = parse_tool_calls(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
@@ -1427,8 +1619,11 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                             tool_choice)
+        if isinstance(self.server.engine, K3Engine):
+            prompt = render_chat_k3(body.get("messages"), tools, tool_choice)
+        else:
+            prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                                 tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
@@ -1654,15 +1849,20 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots)
     runtime = None
-    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigterm = signal.getsignal(signal.SIGTERM) if threading.current_thread() is threading.main_thread() else None
     try:
-        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
+        if is_k3_engine(engine):
+            runtime = K3Engine(engine, model, cap, max_tokens, env)
+        else:
+            runtime = Engine(engine, model, cap, max_tokens, env, kv_slots)
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
-        signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         server.serve_forever()
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         server.scheduler.close()
         server.server_close()
         if runtime is not None:
@@ -1671,11 +1871,16 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    # ENGINE env var: "kimik3" selects the K3 engine; the --engine flag can also
+    # be a path to the binary. Default is the colibri binary next to this file.
+    default_eng = os.environ.get("ENGINE") or str(default_engine())
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(default_engine()))
+    parser.add_argument("--engine", default=default_eng,
+                        help="engine binary path, or 'kimik3' for the Kimi-K3 engine")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
+    # model_id default is resolved AFTER parsing (depends on the --engine value).
+    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID"))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
@@ -1686,8 +1891,20 @@ def main():
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
     parser.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
     args = parser.parse_args()
+    # Resolve "kimik3" to the actual binary path next to this file.
+    engine_path = args.engine
+    if engine_path in ("kimik3", "kimik3.exe"):
+        for name in ("kimik3", "kimik3.exe"):
+            candidate = HERE / name
+            if candidate.exists():
+                engine_path = candidate
+                break
+    # Determine model_id: explicit --model-id wins; otherwise "kimi-k3" for K3,
+    # "glm-5.2-colibri" for the default GLM engine.
+    if args.model_id is None:
+        args.model_id = "kimi-k3" if is_k3_engine(engine_path) else "glm-5.2-colibri"
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
-          args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
+          args.cap,args.max_tokens,engine_path,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots)
 
 

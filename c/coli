@@ -74,10 +74,9 @@ else:
     TOOLS = os.path.join(_LIBEXEC, "tools")
     sys.path.insert(0, _LIBEXEC)   # so `import resource_plan`, `doctor`, `openai_server` still resolve
 
-# Kimi-K3 engine binary: same lookup rules as GLM (run-in-place first, then libexec).
+# kimik3 engine binary: lives next to colibri, or under LIBEXEC after install.
 _here_kimik3 = os.path.join(HERE, "kimik3" + _EXE)
-_libexec_kimik3 = os.path.join(_LIBEXEC, "kimik3" + _EXE)
-KIMIK3 = _here_kimik3 if os.path.exists(_here_kimik3) else _libexec_kimik3
+K3 = _here_kimik3 if os.path.exists(_here_kimik3) else os.path.join(_LIBEXEC, "kimik3" + _EXE)
 
 DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
 END   = b"\x01\x01END\x01\x01\n"
@@ -486,26 +485,6 @@ def cmd_build(a):
                   f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
     sys.exit(subprocess.call(["make","-C",HERE,"colibri"]))
 
-def cmd_build_kimik3(a):
-    banner("build kimik3")
-    if not os.path.exists(os.path.join(HERE, "Makefile")):
-        sys.exit(f"{C.yel}coli build-kimik3{C.r} only works from a source checkout (this is an installed copy).\n"
-                  f"  Clone https://github.com/JustVugg/colibri and run: make -C c kimik3")
-    sys.exit(subprocess.call(["make","-C",HERE,"kimik3"]))
-
-def cmd_kimik3(a):
-    """Run the Kimi-K3 engine directly: SNAP=<k3_dir> coli kimik3 [cap] [ref.json]"""
-    if not os.path.exists(KIMIK3):
-        sys.exit(f"{C.yel}kimik3 engine is not built.{C.r} Run: coli build-kimik3")
-    snap = a.model or os.environ.get("SNAP")
-    if not snap or not os.path.isdir(snap):
-        sys.exit(f"{C.yel}K3 model dir not found.{C.r} Set COLI_MODEL or --model <k3_dir>")
-    env = dict(os.environ, SNAP=snap)
-    args = [KIMIK3]
-    if getattr(a, "cap", None): args.append(str(a.cap))
-    if getattr(a, "ref", None):  args.append(a.ref)
-    sys.exit(subprocess.call(args, env=env))
-
 def cmd_info(a):
     banner("info")
     cfgp=os.path.join(a.model,"config.json")
@@ -582,6 +561,20 @@ def cmd_run(a):
     tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
     e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
     sys.exit(subprocess.call([GLM, str(a.cap)], env=e))
+
+def cmd_kimik3(a):
+    """Run the Kimi-K3 engine. SNAP=<dir> selects the K3 model snapshot."""
+    snap = os.environ.get("SNAP") or a.model
+    if not snap or not os.path.isdir(snap):
+        sys.exit(f"{C.yel}K3 model dir not found:{C.r} set SNAP=<dir> or use --model <dir>")
+    if not os.path.exists(K3):
+        sys.exit(f"{C.yel}kimik3 engine is not built.{C.r} Run: make kimik3")
+    cap = a.cap or 16
+    e = dict(os.environ, SNAP=snap)
+    args = [K3, str(cap)]
+    if a.ngen:
+        e["NGEN"] = str(a.ngen)
+    sys.exit(subprocess.call(args, env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
     """Is a coli serve alive at `base`? Returns its model_id, or None.
@@ -846,16 +839,30 @@ def cmd_chat(a):
 def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
 
 def cmd_serve(a):
-    need_model(a.model)
+    # engine selection: positional `kimik3` or ENGINE env var.
+    # `coli serve kimik3 --port 8000` starts the OpenAI server with the K3 engine.
+    engine_name = (a.engine or os.environ.get("ENGINE") or "").lower()
+    is_k3 = engine_name == "kimik3"
+    if is_k3:
+        if not os.path.exists(K3):
+            sys.exit(f"{C.yel}kimik3 engine is not built.{C.r} Run: make kimik3")
+        snap = a.model
+        if not os.path.isdir(snap):
+            sys.exit(f"{C.yel}K3 model dir not found:{C.r} set COLI_MODEL or use --model <dir>")
+        model_id = a.model_id or "kimi-k3"
+    else:
+        need_model(a.model)
+        model_id = a.model_id or os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
     # EN: pidfile so `coli stop` can shut everything down without manual pkill.
     try:
         with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
     from openai_server import serve
+    engine_bin = K3 if is_k3 else GLM
     try:
-        serve(a.model, a.host, a.port, a.model_id, a.api_key,
-              a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
+        serve(a.model, a.host, a.port, model_id, a.api_key,
+              a.cap,a.ngen,engine_bin,env_for(a),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots)
     finally:
         try: os.unlink(serve_pidfile(a.port))
@@ -884,7 +891,7 @@ def cmd_stop(a):
             if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
                 if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
             comm=open(f"/proc/{pd}/comm").read().strip()
-            if comm in ("colibri","glm","exe","olmoe","kimik3"):
+            if comm in ("colibri","glm","exe","olmoe"):
                 env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
                 if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
         except (OSError,PermissionError): continue
@@ -1006,8 +1013,10 @@ def main():
                     help="never auto-attach, always spawn a private engine")
     pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
+    ps.add_argument("engine", nargs="?", default=None,
+                    help="engine to serve: 'kimik3' for the Kimi-K3 engine (default: colibri/GLM)")
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
-    ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))
+    ps.add_argument("--model-id",default=None)
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
     ps.add_argument("--cors-origin",action="append",default=None)
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
@@ -1036,16 +1045,11 @@ def main():
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
-    # Kimi-K3 subcommands: build the engine and run it on a K3 snapshot.
-    sub.add_parser("build-kimik3", parents=[common], help="compile the Kimi-K3 engine (kimik3.c)")
-    pk=sub.add_parser("kimik3", parents=[common], help="run the Kimi-K3 engine on a snapshot (SNAP=<dir>)")
-    pk.add_argument("cap", nargs="?", type=int, default=16, help="expert cache slots per layer")
-    pk.add_argument("ref", nargs="?", default="ref.json", help="ref.json with prompt_ids/full_ids")
+    pk=sub.add_parser("kimik3", parents=[common], help="run the Kimi-K3 engine (SNAP=<dir>)")
     a=ap.parse_args()
-    handler={"build":cmd_build,"build-kimik3":cmd_build_kimik3,"kimik3":cmd_kimik3,
-             "info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
+    handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
-             "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+             "convert":cmd_convert,"web":cmd_web,"kimik3":cmd_kimik3}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)
 
